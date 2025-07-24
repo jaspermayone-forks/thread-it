@@ -65,6 +65,11 @@ class ThreadItBot(discord.Client):
         self.logger.info(f'Bot logged in as {self.user} (ID: {self.user.id})')
         self.logger.info(f'Connected to {len(self.guilds)} guilds')
 
+        # Log permission status for each guild
+        self.logger.info("Checking permissions across all guilds...")
+        for guild in self.guilds:
+            self.log_guild_permissions(guild)
+
         # Set bot status
         activity = discord.Activity(
             type=discord.ActivityType.watching,
@@ -75,6 +80,9 @@ class ThreadItBot(discord.Client):
     async def on_guild_join(self, guild):
         """Called when the bot joins a new guild."""
         self.logger.info(f'Joined guild: {guild.name} (ID: {guild.id})')
+
+        # Log permission status for the new guild
+        self.log_guild_permissions(guild)
 
     async def on_guild_remove(self, guild):
         """Called when the bot is removed from a guild."""
@@ -103,6 +111,9 @@ class ThreadItBot(discord.Client):
 
         # Handle help command
         if message.content.lower().startswith("!thread-it"):
+            # Check permissions and include setup guidance if needed
+            has_required_perms, missing_required, missing_optional = self.validate_permissions(message.channel)
+
             help_message = (
                 "Hi there! I'm Thread It. My purpose is to keep your Discord channels clean "
                 "by automatically converting message replies into organized public threads.\n\n"
@@ -114,6 +125,32 @@ class ThreadItBot(discord.Client):
                 "notification to guide users to the new thread.\n\n"
                 "**No commands are needed for my core function!** Just reply to a message, and I'll do the rest."
             )
+
+            # Add permission status information
+            if not has_required_perms:
+                permission_list = "\n".join(f"• {perm}" for perm in missing_required)
+                help_message += (
+                    f"\n\n⚠️ **Permission Setup Required**\n"
+                    f"I'm currently missing some required permissions in this channel:\n\n"
+                    f"{permission_list}\n\n"
+                    "**To fix this:**\n"
+                    "1. Go to Server Settings → Roles\n"
+                    "2. Find the 'Thread It' role (or @Thread It)\n"
+                    "3. Enable the missing permissions listed above\n"
+                    "4. Or re-invite me with the correct permissions: https://discord.com/oauth2/authorize?client_id=1386888801229734018"
+                )
+            elif missing_optional:
+                help_message += (
+                    f"\n\n📝 **Optional Enhancement**\n"
+                    f"For the best experience, consider granting the 'Manage Messages' permission. "
+                    f"This allows me to clean up the original reply messages after moving them to threads. "
+                    f"Without this permission, I'll still create threads but won't delete the original replies."
+                )
+            else:
+                help_message += (
+                    f"\n\n✅ **All permissions are correctly set up!** I'm ready to organize your conversations."
+                )
+
             await message.reply(help_message)
             return
 
@@ -154,12 +191,21 @@ class ThreadItBot(discord.Client):
                 return
 
             # Check permissions before proceeding
-            has_perms, missing_perms = self.validate_permissions(message.channel)
-            if not has_perms:
+            has_required_perms, missing_required, missing_optional = self.validate_permissions(message.channel)
+            if not has_required_perms:
                 self.logger.error(
-                    f"Missing required permissions in #{message.channel.name}: {', '.join(missing_perms)}"
+                    f"Missing required permissions in #{message.channel.name}: {', '.join(missing_required)}"
                 )
+                # Try to send error message to users if we can
+                await self.send_permission_error_message(message.channel, missing_required)
                 return
+
+            # Log missing optional permissions for information (but don't stop processing)
+            if missing_optional:
+                self.logger.info(
+                    f"Missing optional permissions in #{message.channel.name}: {', '.join(missing_optional)} "
+                    f"(bot will continue with reduced functionality)"
+                )
 
             # Gather information from the reply message as specified in design doc
             reply_info = await self.gather_reply_information(message)
@@ -401,7 +447,7 @@ class ThreadItBot(discord.Client):
     async def cleanup_messages(self, thread, reply_info):
         """
         Clean up messages as specified in the design document:
-        1. Delete the original reply message
+        1. Delete the original reply message (if we have manage_messages permission)
         2. Send a temporary notification to guide the user to the thread
 
         The notification message mentions the user and directs them to continue
@@ -411,14 +457,25 @@ class ThreadItBot(discord.Client):
         in the on_message event handler for better reliability.
 
         Args:
+            thread: The thread that was created
             reply_info: Dictionary containing reply information
         """
-        # Delete the original reply message
-        deletion_successful = await self.delete_original_reply(reply_info)
+        # Check if we have permission to delete messages
+        can_delete = self.check_specific_permission(reply_info['channel'], 'manage_messages')
 
-        # Send temporary notification only if deletion was successful
-        if deletion_successful:
-            await self.send_temporary_notification(thread, reply_info)
+        deletion_successful = False
+        if can_delete:
+            # Delete the original reply message
+            deletion_successful = await self.delete_original_reply(reply_info)
+        else:
+            self.logger.info(
+                f"Skipping message deletion in #{reply_info['channel'].name} - "
+                f"missing manage_messages permission (this is optional)"
+            )
+
+        # Send temporary notification regardless of deletion success
+        # This helps users find the thread even if we couldn't delete the original message
+        await self.send_temporary_notification(thread, reply_info, deletion_successful)
 
     async def delete_original_reply(self, reply_info):
         """
@@ -459,33 +516,45 @@ class ThreadItBot(discord.Client):
             self.logger.exception(f"Unexpected error deleting original reply message {reply_info['message_id']}: {e}")
             return False
 
-    async def send_temporary_notification(self, thread, reply_info):
+    async def send_temporary_notification(self, thread, reply_info, deletion_successful=True):
         """
         Send a temporary notification message directing the user to continue in the thread.
         The notification automatically deletes after 8 seconds.
 
         Args:
+            thread: The thread that was created
             reply_info: Dictionary containing reply information
+            deletion_successful: Whether the original message was successfully deleted
         """
         try:
             channel = reply_info['channel']
             user = reply_info['author']
 
-            notification_content = f"{user.mention}, please continue your conversation in {thread.mention}."
+            if deletion_successful:
+                notification_content = f"{user.mention}, please continue your conversation in {thread.mention}."
+            else:
+                notification_content = (
+                    f"{user.mention}, I've created a thread for your reply: {thread.mention}. "
+                    f"Please continue your conversation there!"
+                )
 
             # Send the notification message
             notification_message = await channel.send(notification_content)
 
-            self.logger.debug(
-                f"Sent temporary notification to {user} in #{channel.name}, "
-                f"message will auto-delete in 8 seconds"
-            )
-
-            # Schedule automatic deletion after 8 seconds
-            await asyncio.sleep(8)
-            await notification_message.delete()
-
-            self.logger.debug(f"Auto-deleted notification message {notification_message.id} in #{channel.name}")
+            # Schedule automatic deletion after 8 seconds (if we have permission)
+            if deletion_successful:
+                self.logger.debug(
+                    f"Sent temporary notification to {user} in #{channel.name}, "
+                    f"message will auto-delete in 8 seconds"
+                )
+                await asyncio.sleep(8)
+                await notification_message.delete()
+                self.logger.debug(f"Auto-deleted notification message {notification_message.id} in #{channel.name}")
+            else:
+                self.logger.debug(
+                    f"Sent notification message {notification_message.id} in #{channel.name} - "
+                    f"will not auto delete due to missing manage_messages permission"
+                )
 
         except discord.Forbidden:
             self.logger.warning(
@@ -519,37 +588,157 @@ class ThreadItBot(discord.Client):
     def validate_permissions(self, channel):
         """
         Validate that the bot has necessary permissions in the channel.
+        Separates required permissions (bot fails gracefully if missing) from
+        optional permissions (bot works without them).
 
         Args:
             channel: The channel to check permissions for
 
         Returns:
-            tuple: (has_permissions, missing_permissions)
+            tuple: (has_required_permissions, missing_required_permissions, missing_optional_permissions)
         """
         if not channel.guild:
-            return False, ["Not a guild channel"]
+            return False, ["Not a guild channel"], []
 
         bot_member = channel.guild.get_member(self.user.id)
         if not bot_member:
-            return False, ["Bot not in guild"]
+            return False, ["Bot not in guild"], []
 
         permissions = channel.permissions_for(bot_member)
-        missing = []
+        missing_required = []
+        missing_optional = []
 
+        # Required permissions - bot cannot function without these
         required_permissions = [
             ('view_channel', 'View Channels'),
             ('send_messages', 'Send Messages'),
             ('send_messages_in_threads', 'Send Messages in Threads'),
             ('create_public_threads', 'Create Public Threads'),
-            ('manage_messages', 'Manage Messages'),
             ('read_message_history', 'Read Message History')
+        ]
+
+        # Optional permissions - bot can work without these but with reduced functionality
+        optional_permissions = [
+            ('manage_messages', 'Manage Messages')
         ]
 
         for perm_name, perm_display in required_permissions:
             if not getattr(permissions, perm_name, False):
-                missing.append(perm_display)
+                missing_required.append(perm_display)
 
-        return len(missing) == 0, missing
+        for perm_name, perm_display in optional_permissions:
+            if not getattr(permissions, perm_name, False):
+                missing_optional.append(perm_display)
+
+        return len(missing_required) == 0, missing_required, missing_optional
+
+    def check_specific_permission(self, channel, permission_name):
+        """
+        Check if the bot has a specific permission in the channel.
+
+        Args:
+            channel: The channel to check permissions for
+            permission_name: The permission attribute name (e.g., 'send_messages')
+
+        Returns:
+            bool: True if the bot has the permission, False otherwise
+        """
+        if not channel.guild:
+            return False
+
+        bot_member = channel.guild.get_member(self.user.id)
+        if not bot_member:
+            return False
+
+        permissions = channel.permissions_for(bot_member)
+        return getattr(permissions, permission_name, False)
+
+    async def send_permission_error_message(self, channel, missing_required_permissions):
+        """
+        Send a user-friendly error message about missing permissions.
+
+        Args:
+            channel: The channel to send the message to
+            missing_required_permissions: List of missing required permission names
+        """
+        if not self.check_specific_permission(channel, 'send_messages'):
+            # Can't send error message if we don't have send_messages permission
+            self.logger.error(
+                f"Cannot send permission error message in #{channel.name} - missing Send Messages permission"
+            )
+            return
+
+        try:
+            permission_list = "\n".join(f"• {perm}" for perm in missing_required_permissions)
+            error_message = (
+                "⚠️ **Thread It Permission Error**\n\n"
+                f"I'm missing some required permissions in this channel to function properly:\n\n"
+                f"{permission_list}\n\n"
+                "**To fix this:**\n"
+                "1. Go to Server Settings → Roles\n"
+                "2. Find the 'Thread It' role (or @Thread It)\n"
+                "3. Enable the missing permissions listed above\n"
+                "4. Or re-invite me with the correct permissions: https://discord.com/oauth2/authorize?client_id=1386888801229734018\n\n"
+            )
+
+            await channel.send(error_message)
+            self.logger.info(f"Sent permission error message to #{channel.name}")
+
+        except discord.Forbidden:
+            self.logger.error(f"Failed to send permission error message in #{channel.name} - forbidden")
+        except discord.HTTPException as e:
+            self.logger.error(f"HTTP error sending permission error message in #{channel.name}: {e}")
+        except Exception as e:
+            self.logger.exception(f"Unexpected error sending permission error message in #{channel.name}: {e}")
+
+    def log_guild_permissions(self, guild):
+        """
+        Log the permission status for a guild and its channels.
+
+        Args:
+            guild: The guild to check permissions for
+        """
+        try:
+            bot_member = guild.get_member(self.user.id)
+            if not bot_member:
+                self.logger.warning(f"Bot not found as member in guild {guild.name} (ID: {guild.id})")
+                return
+
+            # Check guild-level permissions
+            guild_permissions = bot_member.guild_permissions
+            self.logger.info(f"Guild {guild.name} (ID: {guild.id}) - Bot permissions status:")
+
+            # Log key permissions that might affect bot functionality
+            key_guild_permissions = [
+                ('view_channel', 'View Channels'),
+                ('send_messages', 'Send Messages'),
+                ('create_public_threads', 'Create Public Threads'),
+                ('manage_messages', 'Manage Messages'),
+                ('read_message_history', 'Read Message History')
+            ]
+
+            guild_perm_status = []
+            for perm_name, perm_display in key_guild_permissions:
+                has_perm = getattr(guild_permissions, perm_name, False)
+                status = "✓" if has_perm else "✗"
+                guild_perm_status.append(f"{status} {perm_display}")
+
+            self.logger.info(f"  Guild-level permissions: {', '.join(guild_perm_status)}")
+
+            # Log text channels where bot might have issues
+            problematic_channels = []
+            for channel in guild.text_channels:
+                has_required, missing_required, missing_optional = self.validate_permissions(channel)
+                if not has_required:
+                    problematic_channels.append(f"#{channel.name} (missing: {', '.join(missing_required)})")
+
+            if problematic_channels:
+                self.logger.warning(f"  Channels with permission issues: {'; '.join(problematic_channels)}")
+            else:
+                self.logger.info(f"  All text channels have required permissions ✓")
+
+        except Exception as e:
+            self.logger.exception(f"Error logging permissions for guild {guild.name} (ID: {guild.id}): {e}")
 
     async def log_operation_metrics(self, operation, success, duration=None, error=None):
         """
